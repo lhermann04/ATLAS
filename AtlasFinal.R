@@ -1,0 +1,724 @@
+library(shiny)
+library(DT)
+library(dplyr)
+library(ggplot2)
+library(readxl)
+library(tidyr)
+library(officer)
+
+# ==========================================================
+# PRELOAD DATA (DEMO MODE)
+# ==========================================================
+
+demo_data <- read_excel("Biomarkers5.xlsx")
+
+demo_metadata <- read_excel("Biomarker Metadata.xlsx")
+
+# ==========================================================
+# UI
+# ==========================================================
+
+ui <- fluidPage(
+  
+  tags$head(
+    tags$style(HTML("
+  body { background-color: #f5f7fa; font-family: 'Inter', sans-serif; }
+
+  .main-title {
+    background: linear-gradient(135deg, #001f3f 0%, #003d7a 100%);
+    color: white;
+    padding: 25px;
+    margin: -15px -15px 20px -15px;
+  }
+
+  .card {
+    background: white;
+    padding: 20px;
+    border-radius: 12px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    margin-bottom: 20px;
+  }
+
+  .metric-box {
+    background: linear-gradient(135deg, #001f3f 0%, #003d7a 100%);
+    color: white;
+    padding: 15px;
+    border-radius: 8px;
+    font-weight: 600;
+    text-align: center;
+  }
+
+  .btn-lg {
+    padding: 12px 18px;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 10px;
+  }
+
+  td.details-control {
+    cursor: pointer;
+    text-align: center;
+    font-weight: bold;
+  }
+
+  td.details-control::before {
+    content: \"▶\";
+    font-size: 14px;
+    color: #001f3f;
+  }
+
+  tr.shown td.details-control::before {
+    content: \"▼\";
+  }
+"))
+  ),
+  
+  tags$script(HTML("
+Shiny.addCustomMessageHandler('injectDetails', function(message) {
+  var container = document.getElementById('details-' + message.id);
+  if(container){
+    container.innerHTML = message.html;
+  }
+});
+")),
+  
+  div(class = "main-title",
+      h1("Atlas: Engineering Endpoints for Tiny Cohorts")
+  ),
+  
+  sidebarLayout(
+    
+    sidebarPanel(width = 3,
+                 
+                 div(class="card",
+                     h4("Upload Community Dataset"),
+                     fileInput("datafile",
+                               "Upload Excel (.xlsx)",
+                               accept = ".xlsx"),
+                     helpText("If no file uploaded, demo dataset is used.")
+                 ),
+                 
+                 div(class="card",
+                     h4("Simulation Settings"),
+                     numericInput("n_patients","Simulated N",10),
+                     sliderInput("effect_size",
+                                 "Expected Improvement (%)",
+                                 0,50,10),
+                     sliderInput("noise_level",
+                                 "Noise Multiplier",
+                                 0.5,2,1.2,step=0.1),
+                     selectInput(
+                       "selected_biomarker",
+                       "Endpoint for Simulation",
+                       choices = NULL
+                     ),
+                     actionButton(
+                       "run_sim",
+                       label = tagList(
+                         icon("play"),
+                         "Run Simulation"
+                       ),
+                       class = "btn-primary btn-lg btn-block"
+                     )
+                 )
+    ),
+    
+    mainPanel(width = 9,
+              
+              tabsetPanel(
+                
+                tabPanel("Data Explorer",
+                         div(class="card",
+                             h4("Active Dataset"),
+                             DTOutput("data_table")
+                         )
+                ),
+                
+                tabPanel("Genotype–Phenotype",
+                         div(class="card",
+                             h4("Variant Distribution"),
+                             plotOutput("variant_plot", height="300px")
+                         ),
+                         div(class="card",
+                             h4("Symptom Severity by Variant"),
+                             plotOutput("symptom_plot", height="400px")
+                         )
+                ),
+                
+                tabPanel("Biomarker Discovery",
+                         div(class="card",
+                             h4("Biomarker Detectability Ranking"),
+                             DTOutput("biomarker_ranking")
+                         )
+                ),
+                
+                tabPanel("Detectability Simulation",
+                         div(class="card",
+                             h4("Simulated Endpoint Trajectories"),
+                             plotOutput("simulation_plot", height="400px")
+                         ),
+                         fluidRow(
+                           column(4, div(class="metric-box",
+                                         textOutput("variance_ratio"))),
+                           column(4, div(class="metric-box",
+                                         textOutput("detection_prob"))),
+                           column(4, div(class="metric-box",
+                                         textOutput("endpoint_recommendation")))
+                         )
+                ),
+                
+                # ✅ NOW IT'S A PROPER TOP-LEVEL TAB
+                tabPanel("Literature",
+                         div(class="card",
+                             h4("Published Literature & Registry References"),
+                             uiOutput("publications_text")
+                         )
+                )
+              )
+    )
+  )
+)
+
+
+# ==========================================================
+# SERVER
+# ==========================================================
+
+server <- function(input, output, session) {
+  
+  
+  # --------------------------------------------------------
+  # DATA SOURCE LOGIC
+  # --------------------------------------------------------
+  
+  
+  raw_data <- reactive({
+    if (is.null(input$datafile)) {
+      showNotification("Demo dataset loaded (GLUT1 case study mode)", type="message")
+      return(demo_data)
+    } else {
+      return(read_excel(input$datafile$datapath))
+    }
+  })
+  
+  # --------------------------------------------------------
+  # METADATA CLEANING
+  # --------------------------------------------------------
+  
+  metadata <- reactive({
+    
+    df <- demo_metadata
+    
+    names(df) <- tolower(names(df))
+    colnames(df) <- gsub(" ", "_", colnames(df))
+    
+    df$biomarker <- trimws(df$biomarker)
+    
+    df
+  })
+  
+  # --------------------------------------------------------
+  # FEASIBILITY SCORING
+  # --------------------------------------------------------
+  
+  feasibility_scores <- reactive({
+    
+    df <- metadata()
+    
+    df %>%
+      mutate(
+        
+        setting_score = case_when(
+          measurement_setting == "Home" ~ 3,
+          measurement_setting == "Hybrid" ~ 2,
+          measurement_setting == "Clinic" ~ 1,
+          TRUE ~ 1
+        ),
+        
+        cost_score = case_when(
+          cost_tier == "Low" ~ 3,
+          cost_tier == "Moderate" ~ 2,
+          cost_tier == "High" ~ 1,
+          TRUE ~ 1
+        ),
+        
+        confounder_penalty = case_when(
+          confounder_risk == "Low" ~ 0,
+          confounder_risk == "Moderate" ~ -0.5,
+          confounder_risk == "High" ~ -1,
+          TRUE ~ 0
+        ),
+        
+        feasibility_score =
+          (setting_score + cost_score)/2 + confounder_penalty
+      )
+  })
+  
+  # --------------------------------------------------------
+  #select biomarker
+  # --------------------------------------------------------
+  
+  observeEvent(biomarker_scores(), {
+    
+    scores <- biomarker_scores()
+    
+    if(nrow(scores) > 0){
+      
+      updateSelectInput(
+        session,
+        "selected_biomarker",
+        choices = scores$biomarker,
+        selected = scores$biomarker[1]
+      )
+      
+    }
+    
+  }, ignoreInit = FALSE)
+  
+  # -------------------------------------------------------- 
+  #Publications Tab
+  # --------------------------------------------------------
+  
+  publications_path <- "Publications.docx"
+  
+  publications_content <- reactive({
+    
+    if (!file.exists(publications_path)) {
+      return(HTML("<p style='color:red;'>Publications.docx not found.</p>"))
+    }
+    
+    tryCatch({
+      
+      doc <- read_docx(publications_path)
+      text_content <- docx_summary(doc)
+      
+      paragraphs <- text_content[text_content$content_type == "paragraph", ]
+      
+      html_parts <- sapply(paragraphs$text, function(p) {
+        if (nchar(p) > 0) {
+          if (nchar(p) < 100 && (toupper(p) == p || grepl(":$", p))) {
+            paste0("<h3>", p, "</h3>")
+          } else {
+            paste0("<p>", p, "</p>")
+          }
+        } else {
+          NULL
+        }
+      })
+      
+      html_parts <- html_parts[!sapply(html_parts, is.null)]
+      
+      HTML(paste(html_parts, collapse = "\n"))
+      
+    }, error = function(e) {
+      HTML(paste0("<p style='color:red;'>Error reading file: ", e$message, "</p>"))
+    })
+  })
+  
+  output$publications_text <- renderUI({
+    publications_content()
+  })
+  # --------------------------------------------------------
+  # CLEANING LAYER
+  # --------------------------------------------------------
+  
+  cleaned_data <- reactive({
+    df <- raw_data()
+    
+    names(df) <- tolower(names(df))
+    colnames(df) <- gsub(" ", "_", colnames(df))
+    
+    if("variant" %in% names(df)){
+      df$variant <- trimws(as.character(df$variant))
+      df$variant[df$variant == ""] <- NA
+    }
+    
+    if("patient_id" %in% names(df)){
+      df$patient_id <- trimws(as.character(df$patient_id))
+    }
+    
+    if("biomarker" %in% names(df)){
+      df$biomarker <- trimws(df$biomarker)
+    }
+    
+    df
+  })
+  
+  
+  
+  patient_summary <- reactive({
+    
+    cleaned_data() %>%
+      distinct(patient_id, .keep_all = TRUE) %>%
+      select(
+        patient_id,
+        gene,
+        variant,
+        variant_type,
+        age
+      )
+  })
+  
+  # --------------------------------------------------------
+  # DATA TABLE
+  # --------------------------------------------------------
+  
+  output$data_table <- renderDT({
+    
+    df <- patient_summary()
+    
+    # Add empty column for expand control
+    df$` ` <- ""
+    
+    df <- df[, c(" ", "patient_id", "gene", "variant", "variant_type", "age")]
+    
+    datatable(
+      df,
+      escape = FALSE,
+      rownames = FALSE,
+      selection = "none",
+      options = list(
+        paging = FALSE,
+        scrollY = "400px",
+        scrollCollapse = TRUE,
+        dom = "ft",
+        columnDefs = list(
+          list(
+            className = 'details-control',
+            orderable = FALSE,
+            targets = 0
+          )
+        )
+      ),
+      callback = JS("
+      var format = function(patient_id) {
+        return '<div id=\"details-' + patient_id + '\"></div>';
+      };
+
+      table.on('click', 'td.details-control', function () {
+        var tr = $(this).closest('tr');
+        var row = table.row(tr);
+
+        if (row.child.isShown()) {
+          row.child.hide();
+          tr.removeClass('shown');
+        } else {
+          var patient_id = row.data()[1];
+          row.child(format(patient_id)).show();
+          tr.addClass('shown');
+          Shiny.setInputValue('expand_patient', patient_id, {priority: 'event'});
+        }
+      });
+    ")
+    )
+  })
+  
+  
+  
+  # --------------------------------------------------------
+  # GENOTYPE–PHENOTYPE
+  # --------------------------------------------------------
+  
+  output$variant_plot <- renderPlot({
+    
+    df <- cleaned_data() %>%
+      filter(!is.na(variant_type),
+             variant_type != "") %>%
+      distinct(patient_id, .keep_all = TRUE) %>%
+      count(variant_type)
+    
+    req(nrow(df) > 0)
+    
+    df <- df %>%
+      mutate(percent = round(n / sum(n) * 100, 1),
+             label = paste0(percent, "%"))
+    
+    ggplot(df, aes(x = reorder(variant_type, n), y = n)) +
+      geom_col(fill = "#0A1F44", width = 0.7) +
+      geom_text(aes(label = label), hjust = -0.2) +
+      coord_flip() +
+      theme_minimal(base_size = 14) +
+      labs(
+        x = "Variant Type",
+        y = "Number of Patients",
+        title = "Distribution of Variant Types"
+      ) +
+      expand_limits(y = max(df$n) + 0.5)
+  })
+  
+  output$symptom_plot <- renderPlot({
+    cleaned_data() %>%
+      group_by(variant, symptom) %>%
+      summarise(mean_severity = mean(severity, na.rm=TRUE),
+                .groups="drop") %>%
+      ggplot(aes(x=symptom, y=mean_severity, fill=variant)) +
+      geom_col(position="dodge") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle=45, hjust=1))
+  })
+  
+  # --------------------------------------------------------
+  # BIOMARKER RANKING (FIXED)
+  # --------------------------------------------------------
+  
+  biomarker_scores <- reactive({
+    
+    req("biomarker" %in% names(cleaned_data()))
+    
+    # -------------------------
+    # Detectability component
+    # -------------------------
+    
+    detect_df <- cleaned_data() %>%
+      filter(!is.na(biomarker),
+             biomarker != "") %>%
+      group_by(biomarker, patient_id) %>%
+      summarise(sd_within = sd(biomarker_value, na.rm=TRUE),
+                .groups="drop") %>%
+      group_by(biomarker) %>%
+      summarise(mean_within_sd = mean(sd_within, na.rm=TRUE),
+                .groups="drop") %>%
+      filter(!is.na(mean_within_sd),
+             mean_within_sd > 0) %>%
+      mutate(detectability_score = 1 / mean_within_sd)
+    
+    # -------------------------
+    # Join feasibility metadata
+    # -------------------------
+    
+    combined <- detect_df %>%
+      left_join(feasibility_scores(), by="biomarker")
+    
+    # -------------------------
+    # Composite readiness score
+    # -------------------------
+    
+    combined %>%
+      mutate(
+        regulatory_readiness_score =
+          0.6 * detectability_score +
+          0.4 * feasibility_score
+      ) %>%
+      arrange(desc(regulatory_readiness_score))
+  })
+  
+  output$biomarker_ranking <- renderDT({
+    
+    datatable(
+      biomarker_scores() %>%
+        select(
+          biomarker,
+          mean_within_sd,
+          detectability_score,
+          feasibility_score,
+          regulatory_readiness_score
+        )
+    )
+  })
+  
+  observeEvent(input$expand_patient, {
+    
+    selected_id <- input$expand_patient
+    
+    details_df <- cleaned_data() %>%
+      filter(patient_id == selected_id) %>%
+      select(
+        date,
+        symptom,
+        severity,
+        biomarker,
+        biomarker_value,
+        unit
+      )
+    
+    details_html <- paste0(
+      "<table class='table table-sm table-striped' style='margin-left:40px; width:auto;'>",
+      "<thead><tr>",
+      paste0("<th>", names(details_df), "</th>", collapse = ""),
+      "</tr></thead><tbody>",
+      paste0(
+        apply(details_df, 1, function(row) {
+          paste0("<tr>",
+                 paste0("<td>", row, "</td>", collapse = ""),
+                 "</tr>")
+        }),
+        collapse = ""
+      ),
+      "</tbody></table>"
+    )
+    
+    session$sendCustomMessage(
+      type = "injectDetails",
+      message = list(
+        id = selected_id,
+        html = details_html
+      )
+    )
+  })
+  
+  # --------------------------------------------------------
+  # SIMULATION ENGINE
+  # --------------------------------------------------------
+  
+  sim_data <- eventReactive(input$run_sim, {
+    
+    req(nrow(biomarker_scores()) > 0)
+    req(input$selected_biomarker)
+    
+    n <- input$n_patients
+    effect <- input$effect_size / 100
+    noise <- input$noise_level
+    
+    selected_sd <- biomarker_scores() %>%
+      filter(biomarker == input$selected_biomarker) %>%
+      pull(mean_within_sd)
+    
+    req(length(selected_sd) == 1)
+    
+    # ✅ GET REAL BIOMARKER MEAN
+    selected_stats <- cleaned_data() %>%
+      filter(biomarker == input$selected_biomarker) %>%
+      summarise(mean_value = mean(biomarker_value, na.rm = TRUE))
+    
+    baseline_mean <- selected_stats$mean_value
+    treatment_mean <- baseline_mean * (1 - effect)
+    
+    weeks <- 1:12
+    baseline_weeks <- 1:6
+    treatment_weeks <- 7:12
+    
+    sim_list <- lapply(1:n, function(i) {
+      
+      baseline_values <- rnorm(
+        length(baseline_weeks),
+        mean = baseline_mean,
+        sd = selected_sd
+      )
+      
+      treatment_values <- rnorm(
+        length(treatment_weeks),
+        mean = treatment_mean,
+        sd = selected_sd * noise
+      )
+      
+      data.frame(
+        patient = paste0("P", i),
+        week = weeks,
+        value = c(baseline_values, treatment_values),
+        phase = c(
+          rep("Baseline", length(baseline_weeks)),
+          rep("Treatment", length(treatment_weeks))
+        )
+      )
+    })
+    
+    bind_rows(sim_list)
+  })
+  
+  output$simulation_plot <- renderPlot({
+    req(sim_data())
+    
+    ggplot(sim_data(),
+           aes(x=week,y=value,group=patient,color=phase))+
+      geom_line(alpha=0.4)+
+      stat_summary(aes(group=phase),
+                   fun=mean,
+                   geom="line",
+                   size=1.5,
+                   color="#001f3f")+
+      theme_minimal()
+  })
+  
+  output$variance_ratio <- renderText({
+    req(sim_data())
+    
+    df <- sim_data()
+    var_treat <- var(df$value[df$phase=="Treatment"])
+    var_base <- var(df$value[df$phase=="Baseline"])
+    
+    paste("Variance Ratio:", round(var_treat/var_base,2))
+  })
+  
+  power_results <- eventReactive(input$run_sim, {
+    
+    req(nrow(biomarker_scores()) > 0)
+    req(input$selected_biomarker)
+    
+    n <- input$n_patients
+    effect <- input$effect_size / 100
+    noise <- input$noise_level
+    
+    selected_sd <- biomarker_scores() %>%
+      filter(biomarker == input$selected_biomarker) %>%
+      pull(mean_within_sd)
+    
+    req(length(selected_sd) == 1)
+    
+    selected_stats <- cleaned_data() %>%
+      filter(biomarker == input$selected_biomarker) %>%
+      summarise(mean_value = mean(biomarker_value, na.rm = TRUE))
+    
+    baseline_mean <- selected_stats$mean_value
+    treatment_mean <- baseline_mean * (1 - effect)
+    
+    n_sim <- 1000
+    
+    p_values <- replicate(n_sim, {
+      
+      baseline_means <- numeric(n)
+      treatment_means <- numeric(n)
+      
+      for(i in 1:n){
+        baseline_vals <- rnorm(6, baseline_mean, selected_sd)
+        treatment_vals <- rnorm(6, treatment_mean, selected_sd * noise)
+        
+        baseline_means[i] <- mean(baseline_vals)
+        treatment_means[i] <- mean(treatment_vals)
+      }
+      
+      t.test(treatment_means, baseline_means, paired=TRUE)$p.value
+    })
+    
+    successes <- sum(p_values < 0.05)
+    power_estimate <- successes / n_sim
+    ci <- binom.test(successes, n_sim)$conf.int
+    
+    list(
+      power = power_estimate,
+      ci = ci
+    )
+  })
+  
+  output$detection_prob <- renderText({
+    
+    req(power_results())
+    
+    paste0(
+      "Statistical Power: ",
+      round(power_results()$power * 100, 1), "% ",
+      "(95% CI: ",
+      round(power_results()$ci[1] * 100, 1), "% – ",
+      round(power_results()$ci[2] * 100, 1), "%)"
+    )
+  })
+  
+  output$endpoint_recommendation <- renderText({
+    
+    scores <- biomarker_scores()
+    
+    if(nrow(scores) == 0){
+      return("Top Endpoint: None (check data quality)")
+    }
+    
+    top <- scores[1,]
+    
+    paste0(
+      "Recommended Endpoint: ",
+      top$biomarker,
+      " | Readiness Score: ",
+      round(top$regulatory_readiness_score,2)
+    )
+  })
+}
+
+shinyApp(ui, server)
